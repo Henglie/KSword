@@ -1,4 +1,5 @@
 #include "WindowGuiHandleTab.h"
+#include "../Framework.h"
 #include "WindowSnapshotSupport.h"
 #include "../UI/TableCompleteExport.h"
 #include "WindowImmutableTableSupport.h"
@@ -36,7 +37,9 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <string>
 #include <unordered_map>
@@ -82,6 +85,19 @@ namespace
         std::uintptr_t displayInfo = 0U;
         std::uintptr_t sharedDelta = 0U;
     };
+
+    // ServerInfoCountPrefix：SERVERINFO 头部。
+    // +0 和 +4 在 x64 上是 SRVIFlags/保留位，真正的 cHandleEntries 位于 +8；
+    // 必须按完整前缀读取，否则会把标志位误判成句柄数量。
+    struct ServerInfoCountPrefix
+    {
+        std::uint32_t srvFlagsLow = 0U;
+        std::uint32_t srvFlagsHigh = 0U;
+        std::uintptr_t handleCount = 0U;
+    };
+
+    static_assert(offsetof(ServerInfoCountPrefix, handleCount) == 8U,
+        "ServerInfoCountPrefix::handleCount must stay at SERVERINFO+8");
 
     struct HandleEntryLayout
     {
@@ -215,32 +231,29 @@ namespace
         return handles;
     }
 
-    std::uint32_t selectHandleCount(
-        const std::array<std::uint32_t, 2U>& candidates,
-        const std::vector<std::uint32_t>& windowHandles)
+    std::uint32_t largestWindowHandleIndex(const std::vector<std::uint32_t>& windowHandles)
     {
         std::uint32_t largestKnownIndex = 0U;
         for (const std::uint32_t handleValue : windowHandles)
         {
             largestKnownIndex = (std::max)(largestKnownIndex, handleValue & 0xFFFFU);
         }
-        std::uint32_t selected = 0U;
-        for (const std::uint32_t candidate : candidates)
+        return largestKnownIndex;
+    }
+
+    std::uint32_t selectHandleCount(
+        const std::uintptr_t reportedCount,
+        const std::vector<std::uint32_t>& windowHandles)
+    {
+        const std::uint32_t largestKnownIndex = largestWindowHandleIndex(windowHandles);
+        // x64 的 SERVERINFO.cHandleEntries 固定在 +8；数量必须覆盖已观察到的
+        // 全部窗口下标，否则说明前缀布局不匹配或共享表尚未就绪。
+        if (reportedCount == 0U || reportedCount > kMaxUserHandles ||
+            reportedCount <= largestKnownIndex)
         {
-            if (candidate == 0U || candidate > kMaxUserHandles || candidate <= largestKnownIndex)
-            {
-                continue;
-            }
-            // SERVERINFO has used both the first and second DWORD for the
-            // handle count across Windows generations. If both look numeric,
-            // prefer the smaller safe bound instead of mistaking flags for a
-            // larger table length and crossing the shared mapping boundary.
-            if (selected == 0U || candidate < selected)
-            {
-                selected = candidate;
-            }
+            return 0U;
         }
-        return selected;
+        return static_cast<std::uint32_t>(reportedCount);
     }
 
     HandleEntryLayout detectHandleEntryLayout(
@@ -339,22 +352,68 @@ namespace
         return { QFileInfo(pathText).fileName(), pathText };
     }
 
+    // hexLogValue：把地址格式化为日志可读的十六进制文本。
+    std::string hexLogValue(const std::uintptr_t value)
+    {
+        char buffer[32]{};
+        std::snprintf(buffer, sizeof(buffer), "0x%llX",
+            static_cast<unsigned long long>(value));
+        return buffer;
+    }
+
+    // logGuiHandleFailure：把一次 GUI 句柄刷新失败写入项目日志。
+    // reason 说明失败阶段，detail 携带地址、LastError 和布局数值，便于现场定位。
+    void logGuiHandleFailure(const char* const reason, const std::string& detail)
+    {
+        kLogEvent failureEvent;
+        err << failureEvent
+            << "[WindowGuiHandleTab] GUI handle refresh failed: reason=" << reason
+            << ", " << detail
+            << eol;
+    }
+
+    // exceptionText：提取后台任务异常文本；不依赖异常类型，避免再次抛出。
+    std::string exceptionText(const std::exception_ptr& failure)
+    {
+        if (!failure)
+        {
+            return "unknown exception";
+        }
+        try
+        {
+            std::rethrow_exception(failure);
+        }
+        catch (const std::exception& error)
+        {
+            return error.what();
+        }
+        catch (...)
+        {
+            return "non-standard exception";
+        }
+    }
+
     GuiHandleSnapshot collectGuiHandles(const ks::window::SnapshotTexts& texts)
     {
         GuiHandleSnapshot snapshot;
 #if !defined(_WIN64)
+        logGuiHandleFailure("unsupported-architecture", "GUI handle enumeration requires x64 build");
         snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.x64_only"), QStringLiteral("状态：当前 GUI Handle 枚举仅支持 x64 构建"));
         return snapshot;
 #else
         HMODULE user32Module = GetModuleHandleW(L"user32.dll");
         if (user32Module == nullptr)
         {
+            const DWORD lastError = GetLastError();
+            logGuiHandleFailure("user32-missing", "lastError=" + std::to_string(lastError));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.user32_missing"), QStringLiteral("状态：user32.dll 未加载"));
             return snapshot;
         }
         const FARPROC sharedInfoExport = GetProcAddress(user32Module, "gSharedInfo");
         if (sharedInfoExport == nullptr)
         {
+            const DWORD lastError = GetLastError();
+            logGuiHandleFailure("gsharedinfo-export-missing", "lastError=" + std::to_string(lastError));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.export_missing"), QStringLiteral("状态：当前 user32.dll 未导出 gSharedInfo"));
             return snapshot;
         }
@@ -364,34 +423,54 @@ namespace
                 &sharedInfo,
                 sizeof(sharedInfo)))
         {
+            const DWORD lastError = GetLastError();
+            logGuiHandleFailure("gsharedinfo-read-failed",
+                "lastError=" + std::to_string(lastError) +
+                ", gSharedInfo=" + hexLogValue(reinterpret_cast<std::uintptr_t>(sharedInfoExport)));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.shared_read_failed"), QStringLiteral("状态：读取 gSharedInfo 失败"));
             return snapshot;
         }
         if (sharedInfo.serverInfo == 0U || sharedInfo.handleEntries == 0U ||
             sharedInfo.handleEntrySize < 20U || sharedInfo.handleEntrySize > 0x100U)
         {
+            logGuiHandleFailure("gsharedinfo-invalid",
+                "serverInfo=" + hexLogValue(sharedInfo.serverInfo) +
+                ", aheList=" + hexLogValue(sharedInfo.handleEntries) +
+                ", entrySize=" + std::to_string(sharedInfo.handleEntrySize));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.shared_invalid"), QStringLiteral("状态：gSharedInfo 指针或 HandleEntrySize 无效"));
             return snapshot;
         }
-        std::array<std::uint32_t, 2U> serverInfoPrefix{};
+        ServerInfoCountPrefix serverInfoPrefix{};
         if (!readCurrentProcessMemory(
                 sharedInfo.serverInfo,
-                serverInfoPrefix.data(),
+                &serverInfoPrefix,
                 sizeof(serverInfoPrefix)))
         {
+            const DWORD lastError = GetLastError();
+            logGuiHandleFailure("serverinfo-read-failed",
+                "lastError=" + std::to_string(lastError) +
+                ", serverInfo=" + hexLogValue(sharedInfo.serverInfo));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.server_read_failed"), QStringLiteral("状态：读取 SERVERINFO 失败"));
             return snapshot;
         }
         const std::vector<std::uint32_t> windowHandles = knownWindowHandles();
-        const std::uint32_t handleCount = selectHandleCount(serverInfoPrefix, windowHandles);
+        const std::uint32_t handleCount = selectHandleCount(serverInfoPrefix.handleCount, windowHandles);
         if (handleCount == 0U)
         {
+            logGuiHandleFailure("handle-count-invalid",
+                "reportedCount=" + std::to_string(serverInfoPrefix.handleCount) +
+                ", largestWindowIndex=" + std::to_string(largestWindowHandleIndex(windowHandles)) +
+                ", srvFlagsLow=" + hexLogValue(serverInfoPrefix.srvFlagsLow) +
+                ", srvFlagsHigh=" + hexLogValue(serverInfoPrefix.srvFlagsHigh) +
+                ", entrySize=" + std::to_string(sharedInfo.handleEntrySize) +
+                ", aheList=" + hexLogValue(sharedInfo.handleEntries));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.count_invalid"), QStringLiteral("状态：SERVERINFO Handle 数量无效"));
             return snapshot;
         }
         const std::size_t totalBytes = static_cast<std::size_t>(handleCount) * sharedInfo.handleEntrySize;
         std::vector<std::uint8_t> handleTable(totalBytes, 0U);
         std::uint32_t readableEntryCount = 0U;
+        DWORD firstReadError = ERROR_SUCCESS;
         for (std::uint32_t index = 0U; index < handleCount; ++index)
         {
             const std::size_t entryOffset = static_cast<std::size_t>(index) * sharedInfo.handleEntrySize;
@@ -406,9 +485,20 @@ namespace
             {
                 ++readableEntryCount;
             }
+            else if (firstReadError == ERROR_SUCCESS)
+            {
+                // 记录第一次读取失败的 LastError，供失败日志携带完整原因。
+                firstReadError = GetLastError();
+            }
         }
         if (readableEntryCount == 0U)
         {
+            logGuiHandleFailure("handle-table-read-failed",
+                "lastError=" + std::to_string(firstReadError) +
+                ", handleCount=" + std::to_string(handleCount) +
+                ", readableCount=" + std::to_string(readableEntryCount) +
+                ", entrySize=" + std::to_string(sharedInfo.handleEntrySize) +
+                ", aheList=" + hexLogValue(sharedInfo.handleEntries));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.table_read_failed"), QStringLiteral("状态：读取 USER Handle 共享表失败"));
             return snapshot;
         }
@@ -419,6 +509,10 @@ namespace
             windowHandles);
         if (layout.name.isEmpty())
         {
+            logGuiHandleFailure("handle-entry-layout-unknown",
+                "handleCount=" + std::to_string(handleCount) +
+                ", entrySize=" + std::to_string(sharedInfo.handleEntrySize) +
+                ", windowHandleCount=" + std::to_string(windowHandles.size()));
             snapshot.statusText = texts.value(QStringLiteral("window.gui_handle.status.layout_failed"), QStringLiteral("状态：无法识别 USER HandleEntry 布局"));
             return snapshot;
         }
@@ -640,7 +734,13 @@ void WindowGuiHandleTab::reconcileRefreshState()
     const QPointer<WindowGuiHandleTab> alive(this);
     m_refreshing = false;
     m_refreshButton->setEnabled(true);
-    if (alive && !m_refreshOperation->isBusy() && !m_refreshOperation->isInFlight()) m_statusLabel->setText(ks::i18n::sourceText(QStringLiteral("后台任务发生异常。")));
+    if (alive && !m_refreshOperation->isBusy() && !m_refreshOperation->isInFlight())
+    {
+        // 控制器在没有交付结果的情况下结束同样属于失败，必须留下日志。
+        kLogEvent failureEvent;
+        warn << failureEvent << "[WindowGuiHandleTab] refresh finished without delivering a result" << eol;
+        m_statusLabel->setText(ks::i18n::sourceText(QStringLiteral("后台任务发生异常。")));
+    }
 }
 
 void WindowGuiHandleTab::refreshAsync()
@@ -671,12 +771,20 @@ void WindowGuiHandleTab::refreshAsync()
         [this](const std::shared_ptr<const GuiHandleSnapshot>& snapshot, std::uint64_t ticket) {
             return applySnapshot(snapshot->tableValues, snapshot->statusText, ticket);
         },
-        [this](std::exception_ptr) {
+        [this](std::exception_ptr failure) {
             const QPointer<WindowGuiHandleTab> alive(this);
             const auto failedGeneration = m_refreshOperation->generation();
             m_refreshing = false;
             m_refreshButton->setEnabled(true);
-            if (alive && m_refreshOperation->isCurrent(failedGeneration)) m_statusLabel->setText(ks::i18n::sourceText(QStringLiteral("后台任务发生异常。")));
+            if (alive && m_refreshOperation->isCurrent(failedGeneration))
+            {
+                // 后台枚举异常此前只改状态文字，异常文本会永久丢失。
+                kLogEvent failureEvent;
+                err << failureEvent
+                    << "[WindowGuiHandleTab] background refresh exception: " << exceptionText(failure)
+                    << eol;
+                m_statusLabel->setText(ks::i18n::sourceText(QStringLiteral("后台任务发生异常。")));
+            }
         });
 }
 
